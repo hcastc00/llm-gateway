@@ -9,7 +9,7 @@ An HTTPS reverse proxy gateway for llama.cpp (or any OpenAI-compatible LLM backe
 ## Installation (one-command)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hcastc00/llm-gateway/main/install.sh | bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hcastc00/llm-gateway/main/install.sh)
 ```
 
 The installer handles Docker installation, interactive config, Cloudflare tunnel setup, and service startup.

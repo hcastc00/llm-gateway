@@ -119,7 +119,11 @@ def _fwd_headers(req: Request, user: str) -> dict[str, str]:
 
 
 def _extract_completion_tokens(chunk: bytes) -> int:
-    """Parse an SSE chunk and return completion_tokens (0 if not found)."""
+    """Parse an SSE chunk and return completion tokens (0 if not found).
+
+    Handles both chat/completions format (completion_tokens) and
+    responses API format (output_tokens).
+    """
     for line in chunk.decode(errors="replace").splitlines():
         if not line.startswith("data:"):
             continue
@@ -128,7 +132,7 @@ def _extract_completion_tokens(chunk: bytes) -> int:
             continue
         try:
             usage = json.loads(raw).get("usage") or {}
-            ct = int(usage.get("completion_tokens", 0))
+            ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
             if ct:
                 return ct
         except (json.JSONDecodeError, ValueError):
@@ -243,7 +247,8 @@ async def proxy(
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             resp = await client.request(request.method, upstream, headers=fwd, content=body)
         try:
-            tokens = int((resp.json().get("usage") or {}).get("completion_tokens", 0))
+            usage = (resp.json().get("usage") or {})
+            tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
         except Exception:
             pass
         safe = {k: v for k, v in resp.headers.items() if k.lower() not in _DROP_HEADERS}

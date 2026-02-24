@@ -12,6 +12,11 @@ USERS_FILE="$(cd "$(dirname "$0")" && pwd)/users.json"
 
 [[ -f "$USERS_FILE" ]] || echo '{}' > "$USERS_FILE"
 
+gen_key() {
+  openssl rand -hex 16 2>/dev/null | sed 's/^/sk-/' \
+    || python3 -c "import secrets; print('sk-' + secrets.token_hex(16))"
+}
+
 cmd="${1:-help}"
 
 case "$cmd" in
@@ -35,9 +40,11 @@ PY
     key="${2:-}"
     user="${3:-}"
     if [[ -z "$key" ]]; then
-      read -rp "API key:  " key
+      local suggested
+      suggested="$(gen_key)"
+      read -rp "API key [$suggested]: " key
+      [[ -z "$key" ]] && key="$suggested"
     fi
-    if [[ -z "$key" ]]; then echo "Key required." >&2; exit 1; fi
     if [[ -z "$user" ]]; then
       read -rp "Username: " user
     fi

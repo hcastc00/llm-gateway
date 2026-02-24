@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # LLM Gateway — one-command installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/llm-gateway/main/install.sh | bash
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/hcastc00/llm-gateway/main/install.sh)
 
 set -euo pipefail
 
@@ -13,6 +13,11 @@ if [[ -t 1 ]]; then
 else
   R='' G='' Y='' B='' W='' N=''
 fi
+
+gen_key() {
+  openssl rand -hex 16 2>/dev/null | sed 's/^/sk-/' \
+    || python3 -c "import secrets; print('sk-' + secrets.token_hex(16))"
+}
 
 info() { printf "${B}▸${N} %s\n" "$*"; }
 ok()   { printf "${G}✓${N} %s\n" "$*"; }
@@ -117,18 +122,22 @@ collect_config() {
   printf "These are the Bearer tokens your clients will use.\n\n"
 
   USERS_JSON="{"
-  local first=true key uname
+  local first=true key uname suggested more
   while true; do
-    printf "${W}API key${N} (blank to finish): "
-    read -r key || true
-    [[ -z "$key" ]] && break
-    printf "${W}Username for this key${N}: "
+    printf "${W}Username${N}: "
     read -r uname || true
     if [[ -z "$uname" ]]; then warn "Username required, skipping."; continue; fi
+    suggested="$(gen_key)"
+    printf "${W}API key${N} [%s]: " "$suggested"
+    read -r key || true
+    [[ -z "$key" ]] && key="$suggested"
     [[ "$first" == true ]] || USERS_JSON+=","
     USERS_JSON+="\"$key\":\"$uname\""
     first=false
-    ok "Added: $uname"
+    ok "Added: $uname  →  $key"
+    printf "${W}Add another user?${N} [y/N]: "
+    read -r more || true
+    [[ "${more,,}" == "y" ]] || break
   done
   [[ "$first" == true ]] && die "At least one API key is required."
   USERS_JSON+="}"
