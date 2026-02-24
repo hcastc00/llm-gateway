@@ -1,0 +1,29 @@
+services:
+
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./users.json:/app/users.json:ro
+    environment:
+      UPSTREAM_URL:   ${UPSTREAM_URL:-http://192.168.1.46:8001}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
+      USERS_FILE:     /app/users.json
+    networks:
+      - internal
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    depends_on:
+      - gateway
+    networks:
+      - internal
+
+networks:
+  internal:

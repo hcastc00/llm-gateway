@@ -1,0 +1,7 @@
+# Secrets — never commit these
+.env
+users.json
+certs/
+
+# Claude Code internal state
+.claude/
