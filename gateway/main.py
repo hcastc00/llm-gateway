@@ -131,7 +131,10 @@ def _extract_completion_tokens(chunk: bytes) -> int:
         if raw == "[DONE]":
             continue
         try:
-            usage = json.loads(raw).get("usage") or {}
+            obj = json.loads(raw)
+            # chat/completions: top-level usage.completion_tokens
+            # responses API non-streaming: top-level usage.output_tokens
+            usage = obj.get("usage") or obj.get("response", {}).get("usage") or {}
             ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
             if ct:
                 return ct
