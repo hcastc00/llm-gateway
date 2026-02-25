@@ -43,6 +43,50 @@ def _users() -> dict[str, str]:
         return {key: os.getenv("API_USER", "admin")} if key else {}
 
 
+# ── Token normalisation ────────────────────────────────────────────────────────
+
+# Fields that map to canonical names (both chat/completions and responses API)
+_KNOWN_USAGE = {
+    "prompt_tokens":     "input",
+    "input_tokens":      "input",
+    "completion_tokens": "output",
+    "output_tokens":     "output",
+    "total_tokens":      "total",
+}
+
+
+def _normalize_usage(usage: dict) -> dict[str, int]:
+    """
+    Collapse API-specific field names into canonical names:
+      prompt_tokens / input_tokens   → input
+      completion_tokens / output_tokens → output
+      total_tokens                   → total
+    Any unknown numeric field (e.g. reasoning_tokens, cache_tokens) is kept as-is.
+    """
+    out: dict[str, int] = {}
+    for k, v in usage.items():
+        if not isinstance(v, (int, float)):
+            continue
+        canonical = _KNOWN_USAGE.get(k, k)
+        # Use the first value seen for aliased keys (don't double-count)
+        if canonical not in out:
+            out[canonical] = int(v)
+    return out
+
+
+def _parse_usage(obj: dict) -> dict:
+    """Extract raw usage dict from both chat/completions and responses API formats."""
+    return obj.get("usage") or obj.get("response", {}).get("usage") or {}
+
+
+def _fmt_usage(usage: dict) -> str:
+    """Format raw upstream usage dict for log lines."""
+    if not usage:
+        return "no usage"
+    parts = [f"{k}={v}" for k, v in usage.items() if isinstance(v, (int, float))]
+    return "  ".join(parts)
+
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 
 class Metrics:
@@ -51,16 +95,17 @@ class Metrics:
         self.waiting: int = 0          # requests held before semaphore
         self.active: int = 0           # requests currently running upstream
         self.latencies: deque[float] = deque(maxlen=200)
-        self.token_log: deque[tuple[float, int]] = deque(maxlen=2000)  # (mono_ts, count)
+        self.token_log: deque[tuple[float, int]] = deque(maxlen=2000)  # (mono_ts, output_tokens)
         self.total_req: int = 0
-        self.total_tokens: int = 0
-        self.user_tokens: dict[str, int] = {}
+        self.totals: dict[str, int] = {}           # global totals per canonical token type
+        self.user_tokens: dict[str, dict[str, int]] = {}  # per-user totals per token type
 
     @property
     def depth(self) -> int:
         return self.waiting + self.active
 
     def tps(self, window: float = 60.0) -> float:
+        """Output tokens per second over the given rolling window."""
         now = time.monotonic()
         return round(
             sum(c for t, c in self.token_log if now - t <= window) / window, 2
@@ -71,14 +116,20 @@ class Metrics:
             return None
         return round(sum(self.latencies) / len(self.latencies), 3)
 
-    async def record(self, elapsed: float, tokens: int, user: str) -> None:
+    async def record(self, elapsed: float, usage: dict[str, int], user: str) -> None:
+        """Record a completed request. usage must already be normalised."""
         async with self._lock:
             self.latencies.append(elapsed)
             self.total_req += 1
-            if tokens:
-                self.token_log.append((time.monotonic(), tokens))
-                self.total_tokens += tokens
-                self.user_tokens[user] = self.user_tokens.get(user, 0) + tokens
+            if usage:
+                out = usage.get("output", 0)
+                if out:
+                    self.token_log.append((time.monotonic(), out))
+                for k, v in usage.items():
+                    self.totals[k] = self.totals.get(k, 0) + v
+                bucket = self.user_tokens.setdefault(user, {})
+                for k, v in usage.items():
+                    bucket[k] = bucket.get(k, 0) + v
 
 
 M = Metrics()
@@ -128,37 +179,8 @@ def _fwd_headers(req: Request, user: str) -> dict[str, str]:
     }
 
 
-def _parse_usage(obj: dict) -> dict:
-    """Extract usage dict from both chat/completions and responses API formats."""
-    return obj.get("usage") or obj.get("response", {}).get("usage") or {}
-
-
-def _fmt_usage(usage: dict) -> str:
-    """Format a usage dict for logging, showing all token fields present."""
-    if not usage:
-        return "no usage"
-    # Normalise to readable short names; keep any unknown fields as-is
-    label = {
-        "prompt_tokens": "prompt",
-        "input_tokens": "input",
-        "completion_tokens": "completion",
-        "output_tokens": "output",
-        "total_tokens": "total",
-    }
-    parts = []
-    for key, val in usage.items():
-        if isinstance(val, (int, float)):
-            parts.append(f"{label.get(key, key)}={val}")
-    return "  ".join(parts)
-
-
-def _output_tokens(usage: dict) -> int:
-    """Return the output/completion token count for metrics tracking."""
-    return int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-
-
 def _extract_usage_from_chunk(chunk: bytes) -> dict:
-    """Parse an SSE chunk and return the usage dict if present (empty dict otherwise)."""
+    """Parse an SSE chunk and return the raw usage dict if present."""
     for line in chunk.decode(errors="replace").splitlines():
         if not line.startswith("data:"):
             continue
@@ -196,10 +218,8 @@ async def _stream(
         "queue_position": q_pos,
         "message": f"Your query is #{q_pos} in the queue",
     })
-    # SSE comment keeps OpenAI-SDK clients happy; data event is readable by custom code
     yield f": queue-position={q_pos}\ndata: {queue_msg}\n\n".encode()
 
-    # Wait for our turn (honour client disconnect/cancellation)
     try:
         await _sem.acquire()
     except asyncio.CancelledError:
@@ -212,14 +232,14 @@ async def _stream(
         M.active += 1
 
     start = time.monotonic()
-    usage: dict = {}
+    raw_usage: dict = {}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             async with client.stream(method, upstream, headers=headers, content=body) as resp:
                 async for chunk in resp.aiter_bytes():
                     chunk_usage = _extract_usage_from_chunk(chunk)
                     if chunk_usage:
-                        usage = chunk_usage
+                        raw_usage = chunk_usage
                     yield chunk
     except (httpx.TimeoutException, httpx.ConnectError) as exc:
         err = json.dumps({"error": {"message": str(exc), "type": "gateway_error"}})
@@ -227,12 +247,12 @@ async def _stream(
     finally:
         _sem.release()
         elapsed = time.monotonic() - start
-        tokens = _output_tokens(usage)
+        usage = _normalize_usage(raw_usage)
         async with M._lock:
             M.active -= 1
-        await M.record(elapsed, tokens, user)
+        await M.record(elapsed, usage, user)
         log.info("[%s] %s /v1/%s → stream done  %s  %.3fs",
-                 user, method, path, _fmt_usage(usage), elapsed)
+                 user, method, path, _fmt_usage(raw_usage), elapsed)
 
 
 # ── Proxy route ────────────────────────────────────────────────────────────────
@@ -259,7 +279,7 @@ async def proxy(
 
     async with M._lock:
         M.waiting += 1
-        q_pos = M.depth  # position includes self
+        q_pos = M.depth
 
     log.info("[%s] %s /v1/%s  q=%d  stream=%s",
              user, request.method, path, q_pos, "yes" if is_stream else "no")
@@ -285,16 +305,14 @@ async def proxy(
         M.active += 1
 
     start = time.monotonic()
-    tokens = 0
-    usage: dict = {}
+    raw_usage: dict = {}
     status_code: int | str = "err"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             resp = await client.request(request.method, upstream, headers=fwd, content=body)
         status_code = resp.status_code
         try:
-            usage = _parse_usage(resp.json())
-            tokens = _output_tokens(usage)
+            raw_usage = _parse_usage(resp.json())
         except Exception:
             pass
         safe = {k: v for k, v in resp.headers.items() if k.lower() not in _DROP_HEADERS}
@@ -309,11 +327,12 @@ async def proxy(
     finally:
         _sem.release()
         elapsed = time.monotonic() - start
+        usage = _normalize_usage(raw_usage)
         async with M._lock:
             M.active -= 1
-        await M.record(elapsed, tokens, user)
+        await M.record(elapsed, usage, user)
         log.info("[%s] %s /v1/%s → %s  %s  %.3fs",
-                 user, request.method, path, status_code, _fmt_usage(usage), elapsed)
+                 user, request.method, path, status_code, _fmt_usage(raw_usage), elapsed)
 
 
 # ── Metrics (no auth) ──────────────────────────────────────────────────────────
@@ -322,20 +341,20 @@ async def proxy(
 async def metrics() -> dict:
     return {
         "queue": {
-            "waiting":  M.waiting,
-            "active":   M.active,
-            "depth":    M.depth,
+            "waiting": M.waiting,
+            "active":  M.active,
+            "depth":   M.depth,
         },
         "throughput": {
-            "tokens_per_second_1m":  M.tps(60),
-            "tokens_per_second_5m":  M.tps(300),
+            "output_tokens_per_second_1m": M.tps(60),
+            "output_tokens_per_second_5m": M.tps(300),
         },
         "latency": {
             "avg_response_time_s": M.avg_latency(),
         },
         "totals": {
             "requests": M.total_req,
-            "tokens":   M.total_tokens,
+            "tokens":   M.totals,
         },
         "per_user_tokens": M.user_tokens,
     }
