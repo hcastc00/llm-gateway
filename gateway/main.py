@@ -19,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 UPSTREAM_URL: str = os.getenv("UPSTREAM_URL", "http://192.168.1.46:8001")
 USERS_FILE: str = os.getenv("USERS_FILE", "/app/users.json")
+METRICS_FILE: str = os.getenv("METRICS_FILE", "/app/data/metrics.json")
 MAX_CONCURRENT: int = int(os.getenv("MAX_CONCURRENT", "1"))
 
 _sem: asyncio.Semaphore  # initialised in lifespan
@@ -131,6 +132,33 @@ class Metrics:
                 for k, v in usage.items():
                     bucket[k] = bucket.get(k, 0) + v
 
+    def load(self, path: str) -> None:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.total_req = int(data.get("total_req", 0))
+            self.totals = data.get("totals", {})
+            self.user_tokens = data.get("user_tokens", {})
+            log.info("Metrics loaded from %s (requests=%d)", path, self.total_req)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.warning("Could not load metrics from %s: %s", path, exc)
+
+    def save(self, path: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "total_req":   self.total_req,
+                    "totals":      self.totals,
+                    "user_tokens": self.user_tokens,
+                }, f)
+            os.replace(tmp, path)
+        except Exception as exc:
+            log.warning("Could not save metrics to %s: %s", path, exc)
+
 
 M = Metrics()
 
@@ -141,7 +169,20 @@ M = Metrics()
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global _sem
     _sem = asyncio.Semaphore(MAX_CONCURRENT)
-    yield
+    M.load(METRICS_FILE)
+
+    async def _periodic_save() -> None:
+        while True:
+            await asyncio.sleep(30)
+            M.save(METRICS_FILE)
+
+    task = asyncio.create_task(_periodic_save())
+    try:
+        yield
+    finally:
+        task.cancel()
+        M.save(METRICS_FILE)
+        log.info("Metrics saved to %s", METRICS_FILE)
 
 
 app = FastAPI(title="LLM Gateway", version="1.0", lifespan=lifespan)
@@ -297,8 +338,9 @@ async def proxy(
         M.waiting += 1
         q_pos = M.depth
 
-    log.info("[%s] %s /v1/%s  q=%d  stream=%s",
-             user, request.method, path, q_pos, "yes" if is_stream else "no")
+    hdrs = {k: v for k, v in request.headers.items() if k.lower() != "authorization"}
+    log.info("[%s] %s /v1/%s  q=%d  stream=%s  headers=%s",
+             user, request.method, path, q_pos, "yes" if is_stream else "no", hdrs)
 
     # ── Streaming ──────────────────────────────────────────────────────────────
     if is_stream:

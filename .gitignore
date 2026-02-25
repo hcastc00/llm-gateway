@@ -2,6 +2,7 @@
 .env
 users.json
 certs/
+data/
 
 # Claude Code internal state
 .claude/
