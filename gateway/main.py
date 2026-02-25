@@ -147,6 +147,21 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="LLM Gateway", version="1.0", lifespan=lifespan)
 
 
+# ── Tunnel guard ───────────────────────────────────────────────────────────────
+
+_LOCAL_ONLY_PATHS = frozenset({"/health", "/metrics"})
+
+
+@app.middleware("http")
+async def block_local_only_from_tunnel(request: Request, call_next):
+    """Block /health and /metrics when the request comes through the Cloudflare tunnel.
+    Cloudflare always injects CF-RAY on tunnel traffic; direct LAN requests won't have it.
+    """
+    if request.url.path in _LOCAL_ONLY_PATHS and "cf-ray" in request.headers:
+        return Response(status_code=404)
+    return await call_next(request)
+
+
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
 _http_bearer = HTTPBearer()
@@ -206,6 +221,7 @@ async def _stream(
     q_pos: int,
     user: str,
     path: str,
+    start: float,
 ) -> AsyncIterator[bytes]:
     """
     1. Immediately sends queue position to the client (before any wait).
@@ -231,7 +247,6 @@ async def _stream(
         M.waiting -= 1
         M.active += 1
 
-    start = time.monotonic()
     raw_usage: dict = {}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
@@ -266,6 +281,7 @@ async def proxy(
     request: Request,
     user: Annotated[str, Depends(get_user)],
 ) -> Response:
+    start = time.monotonic()
     body = await request.body()
     upstream = f"{UPSTREAM_URL}/v1/{path}"
     fwd = _fwd_headers(request, user)
@@ -287,7 +303,7 @@ async def proxy(
     # ── Streaming ──────────────────────────────────────────────────────────────
     if is_stream:
         return StreamingResponse(
-            _stream(upstream, request.method, fwd, body, q_pos, user, path),
+            _stream(upstream, request.method, fwd, body, q_pos, user, path, start),
             media_type="text/event-stream",
             headers={"X-Queue-Position": str(q_pos)},
         )
@@ -304,7 +320,6 @@ async def proxy(
         M.waiting -= 1
         M.active += 1
 
-    start = time.monotonic()
     raw_usage: dict = {}
     status_code: int | str = "err"
     try:
