@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections import deque
@@ -21,6 +22,15 @@ USERS_FILE: str = os.getenv("USERS_FILE", "/app/users.json")
 MAX_CONCURRENT: int = int(os.getenv("MAX_CONCURRENT", "1"))
 
 _sem: asyncio.Semaphore  # initialised in lifespan
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("gateway")
 
 
 def _users() -> dict[str, str]:
@@ -118,29 +128,50 @@ def _fwd_headers(req: Request, user: str) -> dict[str, str]:
     }
 
 
-def _extract_completion_tokens(chunk: bytes) -> int:
-    """Parse an SSE chunk and return completion tokens (0 if not found).
+def _parse_usage(obj: dict) -> dict:
+    """Extract usage dict from both chat/completions and responses API formats."""
+    return obj.get("usage") or obj.get("response", {}).get("usage") or {}
 
-    Handles both chat/completions format (completion_tokens) and
-    responses API format (output_tokens).
-    """
+
+def _fmt_usage(usage: dict) -> str:
+    """Format a usage dict for logging, showing all token fields present."""
+    if not usage:
+        return "no usage"
+    # Normalise to readable short names; keep any unknown fields as-is
+    label = {
+        "prompt_tokens": "prompt",
+        "input_tokens": "input",
+        "completion_tokens": "completion",
+        "output_tokens": "output",
+        "total_tokens": "total",
+    }
+    parts = []
+    for key, val in usage.items():
+        if isinstance(val, (int, float)):
+            parts.append(f"{label.get(key, key)}={val}")
+    return "  ".join(parts)
+
+
+def _output_tokens(usage: dict) -> int:
+    """Return the output/completion token count for metrics tracking."""
+    return int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+
+
+def _extract_usage_from_chunk(chunk: bytes) -> dict:
+    """Parse an SSE chunk and return the usage dict if present (empty dict otherwise)."""
     for line in chunk.decode(errors="replace").splitlines():
         if not line.startswith("data:"):
             continue
         raw = line[5:].strip()
-        if raw == "[DONE]":
+        if raw in ("[DONE]", ""):
             continue
         try:
-            obj = json.loads(raw)
-            # chat/completions: top-level usage.completion_tokens
-            # responses API non-streaming: top-level usage.output_tokens
-            usage = obj.get("usage") or obj.get("response", {}).get("usage") or {}
-            ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-            if ct:
-                return ct
+            usage = _parse_usage(json.loads(raw))
+            if usage:
+                return usage
         except (json.JSONDecodeError, ValueError):
             pass
-    return 0
+    return {}
 
 
 # ── Streaming generator ────────────────────────────────────────────────────────
@@ -152,6 +183,7 @@ async def _stream(
     body: bytes,
     q_pos: int,
     user: str,
+    path: str,
 ) -> AsyncIterator[bytes]:
     """
     1. Immediately sends queue position to the client (before any wait).
@@ -180,12 +212,14 @@ async def _stream(
         M.active += 1
 
     start = time.monotonic()
-    tokens = 0
+    usage: dict = {}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             async with client.stream(method, upstream, headers=headers, content=body) as resp:
                 async for chunk in resp.aiter_bytes():
-                    tokens += _extract_completion_tokens(chunk)
+                    chunk_usage = _extract_usage_from_chunk(chunk)
+                    if chunk_usage:
+                        usage = chunk_usage
                     yield chunk
     except (httpx.TimeoutException, httpx.ConnectError) as exc:
         err = json.dumps({"error": {"message": str(exc), "type": "gateway_error"}})
@@ -193,9 +227,12 @@ async def _stream(
     finally:
         _sem.release()
         elapsed = time.monotonic() - start
+        tokens = _output_tokens(usage)
         async with M._lock:
             M.active -= 1
         await M.record(elapsed, tokens, user)
+        log.info("[%s] %s /v1/%s → stream done  %s  %.3fs",
+                 user, method, path, _fmt_usage(usage), elapsed)
 
 
 # ── Proxy route ────────────────────────────────────────────────────────────────
@@ -224,10 +261,13 @@ async def proxy(
         M.waiting += 1
         q_pos = M.depth  # position includes self
 
+    log.info("[%s] %s /v1/%s  q=%d  stream=%s",
+             user, request.method, path, q_pos, "yes" if is_stream else "no")
+
     # ── Streaming ──────────────────────────────────────────────────────────────
     if is_stream:
         return StreamingResponse(
-            _stream(upstream, request.method, fwd, body, q_pos, user),
+            _stream(upstream, request.method, fwd, body, q_pos, user, path),
             media_type="text/event-stream",
             headers={"X-Queue-Position": str(q_pos)},
         )
@@ -246,20 +286,25 @@ async def proxy(
 
     start = time.monotonic()
     tokens = 0
+    usage: dict = {}
+    status_code: int | str = "err"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             resp = await client.request(request.method, upstream, headers=fwd, content=body)
+        status_code = resp.status_code
         try:
-            usage = (resp.json().get("usage") or {})
-            tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            usage = _parse_usage(resp.json())
+            tokens = _output_tokens(usage)
         except Exception:
             pass
         safe = {k: v for k, v in resp.headers.items() if k.lower() not in _DROP_HEADERS}
         safe["X-Queue-Position"] = str(q_pos)
         return Response(content=resp.content, status_code=resp.status_code, headers=safe)
     except httpx.TimeoutException:
+        status_code = 504
         raise HTTPException(status_code=504, detail="Upstream timeout")
     except httpx.ConnectError:
+        status_code = 502
         raise HTTPException(status_code=502, detail="Cannot connect to upstream LLM")
     finally:
         _sem.release()
@@ -267,6 +312,8 @@ async def proxy(
         async with M._lock:
             M.active -= 1
         await M.record(elapsed, tokens, user)
+        log.info("[%s] %s /v1/%s → %s  %s  %.3fs",
+                 user, request.method, path, status_code, _fmt_usage(usage), elapsed)
 
 
 # ── Metrics (no auth) ──────────────────────────────────────────────────────────
