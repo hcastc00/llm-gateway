@@ -170,6 +170,7 @@ _prom_latency = Histogram(
 )
 _prom_queue_waiting = Gauge("llm_gateway_queue_waiting", "Requests waiting for semaphore")
 _prom_queue_active = Gauge("llm_gateway_queue_active", "Requests running upstream")
+_prom_max_concurrent = Gauge("llm_gateway_max_concurrent", "Configured concurrency limit")
 
 
 # ── App / lifespan ─────────────────────────────────────────────────────────────
@@ -178,6 +179,7 @@ _prom_queue_active = Gauge("llm_gateway_queue_active", "Requests running upstrea
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     global _sem
     _sem = asyncio.Semaphore(MAX_CONCURRENT)
+    _prom_max_concurrent.set(MAX_CONCURRENT)
     M.load(METRICS_FILE)
 
     async def _periodic_save() -> None:
