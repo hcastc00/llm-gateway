@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import time
-from collections import deque
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncIterator
 
@@ -14,6 +13,13 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -95,42 +101,25 @@ class Metrics:
         self._lock = asyncio.Lock()
         self.waiting: int = 0          # requests held before semaphore
         self.active: int = 0           # requests currently running upstream
-        self.latencies: deque[float] = deque(maxlen=200)
-        self.token_log: deque[tuple[float, int]] = deque(maxlen=2000)  # (mono_ts, output_tokens)
         self.total_req: int = 0
         self.totals: dict[str, int] = {}           # global totals per canonical token type
         self.user_tokens: dict[str, dict[str, int]] = {}  # per-user totals per token type
 
-    @property
-    def depth(self) -> int:
-        return self.waiting + self.active
-
-    def tps(self, window: float = 60.0) -> float:
-        """Output tokens per second over the given rolling window."""
-        now = time.monotonic()
-        return round(
-            sum(c for t, c in self.token_log if now - t <= window) / window, 2
-        )
-
-    def avg_latency(self) -> float | None:
-        if not self.latencies:
-            return None
-        return round(sum(self.latencies) / len(self.latencies), 3)
-
     async def record(self, elapsed: float, usage: dict[str, int], user: str) -> None:
         """Record a completed request. usage must already be normalised."""
         async with self._lock:
-            self.latencies.append(elapsed)
             self.total_req += 1
             if usage:
-                out = usage.get("output", 0)
-                if out:
-                    self.token_log.append((time.monotonic(), out))
                 for k, v in usage.items():
                     self.totals[k] = self.totals.get(k, 0) + v
                 bucket = self.user_tokens.setdefault(user, {})
                 for k, v in usage.items():
                     bucket[k] = bucket.get(k, 0) + v
+        # prometheus_client counters/histograms are thread-safe; update outside lock
+        _prom_requests.labels(user=user).inc()
+        _prom_latency.observe(elapsed)
+        for k, v in usage.items():
+            _prom_tokens.labels(user=user, token_type=k).inc(v)
 
     def load(self, path: str) -> None:
         try:
@@ -161,6 +150,26 @@ class Metrics:
 
 
 M = Metrics()
+
+# ── Prometheus metrics ─────────────────────────────────────────────────────────
+
+_prom_requests = Counter(
+    "llm_gateway_requests_total",
+    "Total completed requests",
+    ["user"],
+)
+_prom_tokens = Counter(
+    "llm_gateway_tokens_total",
+    "Total tokens processed",
+    ["user", "token_type"],
+)
+_prom_latency = Histogram(
+    "llm_gateway_request_duration_seconds",
+    "End-to-end request latency in seconds",
+    buckets=[1, 5, 15, 30, 60, 120, 300, 600],
+)
+_prom_queue_waiting = Gauge("llm_gateway_queue_waiting", "Requests waiting for semaphore")
+_prom_queue_active = Gauge("llm_gateway_queue_active", "Requests running upstream")
 
 
 # ── App / lifespan ─────────────────────────────────────────────────────────────
@@ -336,7 +345,7 @@ async def proxy(
 
     async with M._lock:
         M.waiting += 1
-        q_pos = M.depth
+        q_pos = M.waiting + M.active
 
     hdrs = {k: v for k, v in request.headers.items() if k.lower() != "authorization"}
     log.info("[%s] %s /v1/%s  q=%d  stream=%s  headers=%s",
@@ -395,26 +404,10 @@ async def proxy(
 # ── Metrics (no auth) ──────────────────────────────────────────────────────────
 
 @app.get("/metrics")
-async def metrics() -> dict:
-    return {
-        "queue": {
-            "waiting": M.waiting,
-            "active":  M.active,
-            "depth":   M.depth,
-        },
-        "throughput": {
-            "output_tokens_per_second_1m": M.tps(60),
-            "output_tokens_per_second_5m": M.tps(300),
-        },
-        "latency": {
-            "avg_response_time_s": M.avg_latency(),
-        },
-        "totals": {
-            "requests": M.total_req,
-            "tokens":   M.totals,
-        },
-        "per_user_tokens": M.user_tokens,
-    }
+async def metrics() -> Response:
+    _prom_queue_waiting.set(M.waiting)
+    _prom_queue_active.set(M.active)
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")
