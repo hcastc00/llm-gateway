@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./users.sh list
-#   ./users.sh add   [key] [username]
+#   ./users.sh add   [username]
 #   ./users.sh remove <username>
 
 set -euo pipefail
@@ -37,18 +37,12 @@ PY
     ;;
 
   add)
-    key="${2:-}"
-    user="${3:-}"
-    if [[ -z "$key" ]]; then
-      local suggested
-      suggested="$(gen_key)"
-      read -rp "API key [$suggested]: " key
-      [[ -z "$key" ]] && key="$suggested"
-    fi
+    user="${2:-}"
     if [[ -z "$user" ]]; then
       read -rp "Username: " user
     fi
     if [[ -z "$user" ]]; then echo "Username required." >&2; exit 1; fi
+    key="$(gen_key)"
     python3 - "$USERS_FILE" "$key" "$user" <<'PY'
 import json, sys
 f, key, user = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -58,7 +52,7 @@ if key in data:
     sys.exit(1)
 data[key] = user
 json.dump(data, open(f, "w"), indent=2)
-print(f"Added: {user}")
+print(f"Added: {user}  {key}")
 PY
     ;;
 
@@ -89,7 +83,7 @@ PY
     echo ""
     echo "  Commands:"
     echo "    list              List all users and their API keys"
-    echo "    add [key] [user]  Add an API key (prompts if omitted)"
+    echo "    add [user]        Add a user with an auto-generated API key (prompts if omitted)"
     echo "    remove [user]     Remove all keys for a user (prompts if omitted)"
     echo ""
     ;;
