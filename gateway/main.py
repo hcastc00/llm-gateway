@@ -40,6 +40,23 @@ logging.basicConfig(
 log = logging.getLogger("gateway")
 
 
+class _SuppressPollingPaths(logging.Filter):
+    """Drop uvicorn access-log lines for /health and /metrics at INFO level."""
+
+    _PATHS = ("/health ", "/metrics ")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno <= logging.INFO:
+            msg = record.getMessage()
+            if any(p in msg for p in self._PATHS):
+                return False
+        return True
+
+
+# Applied in lifespan after uvicorn configures its own loggers
+_suppress_polling = _SuppressPollingPaths()
+
+
 def _users() -> dict[str, str]:
     """Return {api_key → username} from JSON file, or fall back to env vars."""
     try:
@@ -181,6 +198,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     _sem = asyncio.Semaphore(MAX_CONCURRENT)
     _prom_max_concurrent.set(MAX_CONCURRENT)
     M.load(METRICS_FILE)
+    logging.getLogger("uvicorn.access").addFilter(_suppress_polling)
 
     async def _periodic_save() -> None:
         while True:
@@ -349,9 +367,11 @@ async def proxy(
         M.waiting += 1
         q_pos = M.waiting + M.active
 
-    hdrs = {k: v for k, v in request.headers.items() if k.lower() != "authorization"}
-    log.info("[%s] %s /v1/%s  q=%d  stream=%s  headers=%s",
-             user, request.method, path, q_pos, "yes" if is_stream else "no", hdrs)
+    log.info("[%s] %s /v1/%s  q=%d  stream=%s",
+             user, request.method, path, q_pos, "yes" if is_stream else "no")
+    if log.isEnabledFor(logging.DEBUG):
+        hdrs = {k: v for k, v in request.headers.items() if k.lower() != "authorization"}
+        log.debug("[%s] headers=%s", user, hdrs)
 
     # ── Streaming ──────────────────────────────────────────────────────────────
     if is_stream:
