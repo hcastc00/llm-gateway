@@ -328,11 +328,11 @@ def _fwd_headers(req: Request, user: str) -> dict[str, str]:
     }
 
 
-def _extract_usage_from_chunk(chunk: bytes) -> tuple[dict, dict]:
-    """Parse an SSE chunk and return (raw_usage, timings) if present."""
+def _parse_sse_lines(text: str) -> tuple[dict, dict]:
+    """Scan SSE text for usage and timings dicts from data: lines."""
     usage: dict = {}
     timings: dict = {}
-    for line in chunk.decode(errors="replace").splitlines():
+    for line in text.splitlines():
         if not line.startswith("data:"):
             continue
         raw = line[5:].strip()
@@ -351,6 +351,32 @@ def _extract_usage_from_chunk(chunk: bytes) -> tuple[dict, dict]:
         except (json.JSONDecodeError, ValueError):
             pass
     return usage, timings
+
+
+def _usage_from_timings(timings: dict) -> dict[str, int]:
+    """Derive canonical usage from llama.cpp timings when no usage object exists."""
+    out: dict[str, int] = {}
+    prompt_n = timings.get("prompt_n")
+    if prompt_n is not None:
+        out["input"] = int(prompt_n)
+    predicted_n = timings.get("predicted_n")
+    if predicted_n is not None:
+        out["output"] = int(predicted_n)
+    if "input" in out and "output" in out:
+        out["total"] = out["input"] + out["output"]
+    return out
+
+
+def _estimate_timings(usage: dict[str, int], gen_elapsed: float) -> dict:
+    """Estimate timings from usage + measured generation time (fallback for APIs without timings)."""
+    out_tokens = usage.get("output", 0)
+    if out_tokens > 0 and gen_elapsed > 0:
+        return {
+            "predicted_n": out_tokens,
+            "predicted_ms": gen_elapsed * 1000,
+            "predicted_per_second": out_tokens / gen_elapsed,
+        }
+    return {}
 
 
 # ── Streaming generator ────────────────────────────────────────────────────────
@@ -391,16 +417,17 @@ async def _stream(
 
     raw_usage: dict = {}
     raw_timings: dict = {}
+    # Keep a tail buffer so we can reliably parse the final SSE events
+    # even when aiter_bytes() splits them across chunk boundaries.
+    tail_buf = ""
+    _TAIL_MAX = 16_384  # 16 KB — more than enough for the final events
     gen_start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             async with client.stream(method, upstream, headers=headers, content=body) as resp:
                 async for chunk in resp.aiter_bytes():
-                    chunk_usage, chunk_timings = _extract_usage_from_chunk(chunk)
-                    if chunk_usage:
-                        raw_usage = chunk_usage
-                    if chunk_timings:
-                        raw_timings = chunk_timings
+                    decoded = chunk.decode(errors="replace")
+                    tail_buf = (tail_buf + decoded)[-_TAIL_MAX:]
                     yield chunk
     except (httpx.TimeoutException, httpx.ConnectError) as exc:
         err = json.dumps({"error": {"message": str(exc), "type": "gateway_error"}})
@@ -410,7 +437,18 @@ async def _stream(
         now = time.monotonic()
         elapsed = now - start
         queue_wait = gen_start - start
+        gen_elapsed = now - gen_start
+        # Parse the tail buffer for usage & timings (handles chunk-split events)
+        raw_usage, raw_timings = _parse_sse_lines(tail_buf)
         usage = _normalize_usage(raw_usage)
+        # Derive usage from timings when upstream doesn't send a usage object
+        # (llama.cpp chat/completions streaming puts counts in timings only)
+        if not usage and raw_timings:
+            usage = _usage_from_timings(raw_timings)
+        # Estimate timings when upstream doesn't send them
+        # (e.g. responses API has usage but no timings)
+        if not raw_timings and usage:
+            raw_timings = _estimate_timings(usage, gen_elapsed)
         async with M._lock:
             M.active -= 1
         await M.record(elapsed, queue_wait, usage, raw_timings, user)
@@ -499,7 +537,12 @@ async def proxy(
         now = time.monotonic()
         elapsed = now - start
         queue_wait = gen_start - start
+        gen_elapsed = now - gen_start
         usage = _normalize_usage(raw_usage)
+        if not usage and raw_timings:
+            usage = _usage_from_timings(raw_timings)
+        if not raw_timings and usage:
+            raw_timings = _estimate_timings(usage, gen_elapsed)
         async with M._lock:
             M.active -= 1
         await M.record(elapsed, queue_wait, usage, raw_timings, user)
