@@ -104,11 +104,29 @@ def _parse_usage(obj: dict) -> dict:
 
 
 def _fmt_usage(usage: dict) -> str:
-    """Format raw upstream usage dict for log lines."""
+    """Format normalised usage dict for log lines."""
     if not usage:
         return "no usage"
-    parts = [f"{k}={v}" for k, v in usage.items() if isinstance(v, (int, float))]
-    return "  ".join(parts)
+    parts = [f"{k}={v}" for k, v in usage.items()]
+    return " ".join(parts)
+
+
+def _fmt_timings(timings: dict, queue_wait: float) -> str:
+    """Format upstream timings + queue wait for log lines."""
+    parts = [f"queue={queue_wait:.1f}s"]
+    gen_ms = timings.get("predicted_ms")
+    if gen_ms is not None:
+        parts.append(f"gen={gen_ms / 1000:.1f}s")
+    tps = timings.get("predicted_per_second")
+    if tps is not None:
+        parts.append(f"tps={tps:.2f}")
+    prompt_ms = timings.get("prompt_ms")
+    if prompt_ms is not None:
+        parts.append(f"prompt={prompt_ms / 1000:.1f}s")
+    ptps = timings.get("prompt_per_second")
+    if ptps is not None:
+        parts.append(f"prompt_tps={ptps:.1f}")
+    return " ".join(parts)
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
@@ -122,7 +140,14 @@ class Metrics:
         self.totals: dict[str, int] = {}           # global totals per canonical token type
         self.user_tokens: dict[str, dict[str, int]] = {}  # per-user totals per token type
 
-    async def record(self, elapsed: float, usage: dict[str, int], user: str) -> None:
+    async def record(
+        self,
+        elapsed: float,
+        queue_wait: float,
+        usage: dict[str, int],
+        timings: dict,
+        user: str,
+    ) -> None:
         """Record a completed request. usage must already be normalised."""
         async with self._lock:
             self.total_req += 1
@@ -135,8 +160,22 @@ class Metrics:
         # prometheus_client counters/histograms are thread-safe; update outside lock
         _prom_requests.labels(user=user).inc()
         _prom_latency.observe(elapsed)
+        _prom_queue_wait.observe(queue_wait)
         for k, v in usage.items():
             _prom_tokens.labels(user=user, token_type=k).inc(v)
+        # Record upstream timings when available
+        gen_ms = timings.get("predicted_ms")
+        if gen_ms is not None:
+            _prom_generation.observe(gen_ms / 1000.0)
+        prompt_ms = timings.get("prompt_ms")
+        if prompt_ms is not None:
+            _prom_prompt_eval.observe(prompt_ms / 1000.0)
+        tps = timings.get("predicted_per_second")
+        if tps is not None:
+            _prom_tps.observe(tps)
+        ptps = timings.get("prompt_per_second")
+        if ptps is not None:
+            _prom_prompt_tps.observe(ptps)
 
     def load(self, path: str) -> None:
         try:
@@ -182,8 +221,33 @@ _prom_tokens = Counter(
 )
 _prom_latency = Histogram(
     "llm_gateway_request_duration_seconds",
-    "End-to-end request latency in seconds",
+    "End-to-end request latency including queue wait",
     buckets=[1, 5, 15, 30, 60, 120, 300, 600],
+)
+_prom_queue_wait = Histogram(
+    "llm_gateway_queue_wait_seconds",
+    "Time spent waiting in queue for semaphore",
+    buckets=[0.01, 0.1, 0.5, 1, 5, 15, 30, 60, 120],
+)
+_prom_generation = Histogram(
+    "llm_gateway_generation_seconds",
+    "Actual generation time (from upstream timings when available)",
+    buckets=[1, 5, 15, 30, 60, 120, 300, 600],
+)
+_prom_prompt_eval = Histogram(
+    "llm_gateway_prompt_eval_seconds",
+    "Prompt evaluation time from upstream timings",
+    buckets=[0.1, 0.5, 1, 2, 5, 10, 30],
+)
+_prom_tps = Histogram(
+    "llm_gateway_tokens_per_second",
+    "Token generation speed (tokens/s)",
+    buckets=[0.5, 1, 2, 5, 10, 20, 50, 100],
+)
+_prom_prompt_tps = Histogram(
+    "llm_gateway_prompt_tokens_per_second",
+    "Prompt processing speed (tokens/s)",
+    buckets=[1, 5, 10, 20, 50, 100, 200, 500],
 )
 _prom_queue_waiting = Gauge("llm_gateway_queue_waiting", "Requests waiting for semaphore")
 _prom_queue_active = Gauge("llm_gateway_queue_active", "Requests running upstream")
@@ -264,8 +328,10 @@ def _fwd_headers(req: Request, user: str) -> dict[str, str]:
     }
 
 
-def _extract_usage_from_chunk(chunk: bytes) -> dict:
-    """Parse an SSE chunk and return the raw usage dict if present."""
+def _extract_usage_from_chunk(chunk: bytes) -> tuple[dict, dict]:
+    """Parse an SSE chunk and return (raw_usage, timings) if present."""
+    usage: dict = {}
+    timings: dict = {}
     for line in chunk.decode(errors="replace").splitlines():
         if not line.startswith("data:"):
             continue
@@ -273,12 +339,18 @@ def _extract_usage_from_chunk(chunk: bytes) -> dict:
         if raw in ("[DONE]", ""):
             continue
         try:
-            usage = _parse_usage(json.loads(raw))
-            if usage:
-                return usage
+            obj = json.loads(raw)
+            if not usage:
+                u = _parse_usage(obj)
+                if u:
+                    usage = u
+            if not timings:
+                t = obj.get("timings") or {}
+                if t:
+                    timings = t
         except (json.JSONDecodeError, ValueError):
             pass
-    return {}
+    return usage, timings
 
 
 # ── Streaming generator ────────────────────────────────────────────────────────
@@ -318,26 +390,32 @@ async def _stream(
         M.active += 1
 
     raw_usage: dict = {}
+    raw_timings: dict = {}
+    gen_start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             async with client.stream(method, upstream, headers=headers, content=body) as resp:
                 async for chunk in resp.aiter_bytes():
-                    chunk_usage = _extract_usage_from_chunk(chunk)
+                    chunk_usage, chunk_timings = _extract_usage_from_chunk(chunk)
                     if chunk_usage:
                         raw_usage = chunk_usage
+                    if chunk_timings:
+                        raw_timings = chunk_timings
                     yield chunk
     except (httpx.TimeoutException, httpx.ConnectError) as exc:
         err = json.dumps({"error": {"message": str(exc), "type": "gateway_error"}})
         yield f"data: {err}\n\ndata: [DONE]\n\n".encode()
     finally:
         _sem.release()
-        elapsed = time.monotonic() - start
+        now = time.monotonic()
+        elapsed = now - start
+        queue_wait = gen_start - start
         usage = _normalize_usage(raw_usage)
         async with M._lock:
             M.active -= 1
-        await M.record(elapsed, usage, user)
-        log.info("[%s] %s /v1/%s → stream done  %s  %.3fs",
-                 user, method, path, _fmt_usage(raw_usage), elapsed)
+        await M.record(elapsed, queue_wait, usage, raw_timings, user)
+        log.info("[%s] %s /v1/%s → stream done  %s  %s  total=%.1fs",
+                 user, method, path, _fmt_usage(usage), _fmt_timings(raw_timings, queue_wait), elapsed)
 
 
 # ── Proxy route ────────────────────────────────────────────────────────────────
@@ -394,13 +472,17 @@ async def proxy(
         M.active += 1
 
     raw_usage: dict = {}
+    raw_timings: dict = {}
     status_code: int | str = "err"
+    gen_start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
             resp = await client.request(request.method, upstream, headers=fwd, content=body)
         status_code = resp.status_code
         try:
-            raw_usage = _parse_usage(resp.json())
+            data = resp.json()
+            raw_usage = _parse_usage(data)
+            raw_timings = data.get("timings") or {}
         except Exception:
             pass
         safe = {k: v for k, v in resp.headers.items() if k.lower() not in _DROP_HEADERS}
@@ -414,13 +496,15 @@ async def proxy(
         raise HTTPException(status_code=502, detail="Cannot connect to upstream LLM")
     finally:
         _sem.release()
-        elapsed = time.monotonic() - start
+        now = time.monotonic()
+        elapsed = now - start
+        queue_wait = gen_start - start
         usage = _normalize_usage(raw_usage)
         async with M._lock:
             M.active -= 1
-        await M.record(elapsed, usage, user)
-        log.info("[%s] %s /v1/%s → %s  %s  %.3fs",
-                 user, request.method, path, status_code, _fmt_usage(raw_usage), elapsed)
+        await M.record(elapsed, queue_wait, usage, raw_timings, user)
+        log.info("[%s] %s /v1/%s → %s  %s  %s  total=%.1fs",
+                 user, request.method, path, status_code, _fmt_usage(usage), _fmt_timings(raw_timings, queue_wait), elapsed)
 
 
 # ── Metrics (no auth) ──────────────────────────────────────────────────────────
