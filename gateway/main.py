@@ -423,7 +423,7 @@ async def _stream(
     _TAIL_MAX = 16_384  # 16 KB — more than enough for the final events
     gen_start = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+        async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(method, upstream, headers=headers, content=body) as resp:
                 async for chunk in resp.aiter_bytes():
                     decoded = chunk.decode(errors="replace")
@@ -514,7 +514,7 @@ async def proxy(
     status_code: int | str = "err"
     gen_start = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+        async with httpx.AsyncClient(timeout=None) as client:
             resp = await client.request(request.method, upstream, headers=fwd, content=body)
         status_code = resp.status_code
         try:
